@@ -518,6 +518,45 @@ class EventFilterWindowTest {
   }
 
   @Test
+  void shouldPropagateOwnUpdateEchoWhenGenerationChanged() {
+    // Reproduces the Kroxylicious production failure (traced from CI operator logs).
+    //
+    // Sequence:
+    //   1. Reconciler reads resource at rv=100, gen=2 and starts reconciliation
+    //   2. Filter window opens for a status PATCH
+    //   3. External party changes spec → server creates rv=101, gen=3
+    //   4. Status PATCH applies to current server state (gen=3), producing rv=102
+    //      The resource at rv=102 carries gen=3 (the external spec change)
+    //   5. Only rv=102 arrives in this window (rv=101 not delivered or arrived
+    //      before the window opened)
+    //   6. Window records own rv=102 and sees events={102} == ownVersions={102}
+    //   7. eventForRangeAndClear returns empty → gen=3 spec change silently lost
+    //
+    // The blind spot: eventForRangeAndClear (line 183) compares only resource
+    // version sets. When a PATCH is applied to server state that was mutated by
+    // an external party, the echo at the own rv carries that external change,
+    // but the rv-only comparison cannot detect it.
+    eventFilterWindow.increaseActiveUpdates();
+    eventFilterWindow.addToOwnUpdateVersions(s(FIRST_OWN_VERSION));
+
+    var echoWithExternalChange =
+        new ExtendedResourceEvent(
+            UPDATED,
+            testResourceWithGeneration(FIRST_OWN_VERSION, 3L),
+            testResourceWithGeneration(FIRST_OWN_VERSION - 1, 2L),
+            null);
+    eventFilterWindow.addRelatedEvent(echoWithExternalChange);
+
+    eventFilterWindow.decreaseActiveUpdates();
+
+    assertThat(eventFilterWindow.check())
+        .as(
+            "event at own rv should be propagated when it carries"
+                + " an external generation change (gen 2 → 3)")
+        .isPresent();
+  }
+
+  @Test
   void combinedCaseWithEarlyEvent() {
     // Scenario: an own write is in flight (RV recorded), a foreign event with a
     // lower RV arrives, then the write completes (active → 0) but no echo for
@@ -593,12 +632,17 @@ class EventFilterWindowTest {
   }
 
   ConfigMap testResource(Long version) {
+    return testResourceWithGeneration(version, null);
+  }
+
+  ConfigMap testResourceWithGeneration(Long version, Long generation) {
     var cm = new ConfigMap();
     cm.setMetadata(
         new ObjectMetaBuilder()
             .withName(RESOURCE_ID.getName())
             .withNamespace(RESOURCE_ID.getNamespace().orElseThrow())
             .withResourceVersion(version.toString())
+            .withGeneration(generation)
             .build());
     return cm;
   }
